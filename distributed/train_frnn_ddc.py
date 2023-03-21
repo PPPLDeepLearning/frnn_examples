@@ -64,8 +64,8 @@ def run(local_rank, local_world_size):
     lstm_num_layers = 4     # Number of LSTM layers
 
     # Dataset parameters
-    num_train = 10 # Number of shots used for training
-    num_valid = 4  # Number of shots used for validation
+    num_train = 100 # Number of total shots used for training. These will be split across ranks
+    num_valid = 20 # Number of total shots used for validation. These will be split across ranks.
 
     # fetch dataset definition for list of predictors.
     datapath = "/projects/FRNN/dataset_D3D_100/D3D_100"
@@ -262,8 +262,6 @@ def run(local_rank, local_world_size):
         
         print(f"{rank_str} : Epoch {epoch} took {t_epoch:7.3f}s. train loss = {losses_train[epoch]:8.6e}, valid loss =  {losses_valid[epoch]:8.6e}")
             
-    cleanup()
-
 
 def spmd_main(rank, size, backend="nccl"):
     print("Hello, world")

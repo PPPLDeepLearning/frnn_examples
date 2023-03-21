@@ -19,12 +19,15 @@ logging.basicConfig(filename="FRNN_distributed_test.log",
 
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import sys
 sys.path.append("/home/rkube/repos/d3d_loaders")
@@ -35,17 +38,24 @@ from d3d_loaders.standardizers import standardizer_mean_std
 from d3d_loaders.d3d_loaders import Multishot_dataset
 from d3d_loaders.samplers import BatchedSampler_multi_dist,  collate_fn_batched
 
+"""
+This script demonstrates how to use the (d3d_loaders)[https://github.com/PlasmaControl/d3d_loaders/]
+package for multi-gpu training of disruption prediction using pytorch distributed.
+
+This is basically a parallel version of notebooks/FRNN_test.ipynb
+"""
 
 
-def run(local_world_size, local_rank):
+def run(local_rank, local_world_size):
     rank_str = f"rank {local_rank}/{local_world_size}"
     n_gpus = torch.cuda.device_count() // local_world_size
-
     logging.info("{rank_str} - using {n_gpu} gpus")
 
+
     device_ids = list(range(local_rank * n_gpus, (local_rank + 1) * n_gpus))
-    logging.info(f"[{os.getpid()}] {rank_str}:  n_gpus = {n_gpus}, device_ids = {device_ids}"
-    )
+    logging.info(f"[{os.getpid()}] {rank_str}:  n_gpus = {n_gpus}, device_ids = {device_ids}")
+    
+    torch.cuda.set_device(local_rank)
 
     # Model parameters
     seq_length = 128    # Sequence length used for prediction
@@ -55,7 +65,7 @@ def run(local_world_size, local_rank):
 
     # Dataset parameters
     num_train = 10 # Number of shots used for training
-    num_valid = 2  # Number of shots used for validation
+    num_valid = 4  # Number of shots used for validation
 
     # fetch dataset definition for list of predictors.
     datapath = "/projects/FRNN/dataset_D3D_100/D3D_100"
@@ -97,25 +107,30 @@ def run(local_world_size, local_rank):
 
     # Split
     num_shots = len(shot_list)
+    shots_train_world = shot_list[:num_train]
+    shots_valid_world = shot_list[num_train:num_train + num_valid]
+    # Each rank has to sub-sample training and validation shots
+    shots_train_rank = shots_train_world[local_rank:num_train:local_world_size]
+    shots_valid_rank = shots_valid_world[local_rank:num_train:local_world_size]
+    print(f"{rank_str} - shots_train: {shots_train_rank}, shots_valid: {shots_valid_rank}")
 
 
-    shots_train = shot_list[:num_train]
-    shots_valid = shot_list[num_train:num_train + num_valid]
-
-    # Instantiate datasets
+    # Instantiate datasets. 
     # Create the training set. This can take some time.
-    ds_train = Multishot_dataset(shots_train, d3d_100["predictors"], ["ttd"],
+    ds_train = Multishot_dataset(shots_train_rank, d3d_100["predictors"], ["ttd"],
                                  sampler_pred_dict, sampler_targ_dict, ip_profile, norm_dict, datapath, torch.device("cpu"))
     shot_length_train = []
-    for ix, shotnr in enumerate(shots_train):
+    for ix, shotnr in enumerate(shots_train_rank):
         shot_length_train.append(ds_train.shot(ix).__len__())
         logging.info(f"{rank_str} - Training set: shot {shotnr} - {shot_length_train[-1]} samples")
 
+
+
     # Create the validation set and print stats on length
-    ds_valid = Multishot_dataset(shots_valid, d3d_100["predictors"], ["ttd"],
+    ds_valid = Multishot_dataset(shots_valid_rank, d3d_100["predictors"], ["ttd"],
                                  sampler_pred_dict, sampler_targ_dict, ip_profile, norm_dict, datapath, torch.device("cpu"))
     shot_length_valid = []
-    for ix, shotnr in enumerate(shots_valid):
+    for ix, shotnr in enumerate(shots_valid_rank):
         shot_length_valid.append(ds_valid.shot(ix).__len__())
         logging.info(f"{rank_str} - Validation set: shot {shotnr} - {shot_length_valid[-1]} samples")
 
@@ -185,11 +200,69 @@ def run(local_world_size, local_rank):
             out = self.fc_2(out)  # Final Output
             return out
 
-    model = simple_lstm(1, len(d3d_100["predictors"]), hidden_size=lstm_hidden_size, seq_length=seq_length, num_layers=lstm_num_layers).to(device_ids[0])
-    ddp_model = DDP(model, device_ids)
+    # The 76 comes from having 14 predictors:
+    # 12 scalars - 12
+    # 2 profiles a 32 channels - 64
+    # 12 + 64 = 76
+    model = simple_lstm(1, 76, hidden_size=lstm_hidden_size, seq_length=seq_length, num_layers=lstm_num_layers).to(local_rank)
+    ddp_model = DDP(model, device_ids=[local_rank])
 
-    loss_fn = nn.MSEloss()
+    loss_fn = nn.MSELoss()
     optimizer = optim.Adam(ddp_model.parameters(), lr=5e-4)
+
+    # Train the model. This uses about 15-40% GPU on a single A100, depending on the size of the model.
+
+    num_epochs = 20
+
+    losses_train = np.zeros(num_epochs)
+    losses_valid = np.zeros(num_epochs)
+
+    for epoch in range(num_epochs):
+        # Remember to update the epoch of the samplers to use a new seed for sample shuffling
+        sampler_train.set_epoch(epoch)
+        sampler_valid.set_epoch(epoch)
+
+        t_start = perf_counter()
+        model.train()
+
+        loss_train = 0.0
+        loss_valid = 0.0
+        ix_bt = 0
+        for inputs, target in loader_train:
+            inputs = inputs.to(local_rank) # cuda(non_blocking=True) # to(device)
+            target = target.to(local_rank) # cuda(non_blocking=True) # to(device)
+            optimizer.zero_grad()
+
+            output = model(inputs[:-1, :, :])
+
+            loss = loss_fn(output, target[-1,:,:])
+            loss.backward()
+            optimizer.step()
+
+            loss_train += loss.item()
+            #print(f"batch {ix_b}: loss = {loss.item()}")
+            ix_bt += 1
+        
+        ix_bv = 0
+        with torch.no_grad():
+            for inputs, target in loader_valid:
+                inputs = inputs.to(local_rank) # to(device)
+                target = target.to(local_rank) # to(device)
+                
+                output = model(inputs[:-1, :, :])
+            
+                loss_valid += loss_fn(output, target[-1, :, :]).item()
+                ix_bv += 1
+                
+        losses_train[epoch] = loss_train / ix_bt / batch_size
+        losses_valid[epoch] = loss_valid / ix_bv / batch_size
+        t_end = perf_counter()
+        t_epoch = t_end - t_start
+        
+        
+        print(f"{rank_str} : Epoch {epoch} took {t_epoch:7.3f}s. train loss = {losses_train[epoch]:8.6e}, valid loss =  {losses_valid[epoch]:8.6e}")
+            
+    cleanup()
 
 
 def spmd_main(rank, size, backend="nccl"):
@@ -215,7 +288,7 @@ if __name__ == "__main__":
     parser.add_argument("--local_world_size", type=int, default=1)
     args = parser.parse_args()
 
-    spmd_main(args.local_world_size, args.local_rank)
+    spmd_main(args.local_rank, args.local_world_size)
 
 
 

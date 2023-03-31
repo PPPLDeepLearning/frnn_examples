@@ -229,8 +229,8 @@ def run(local_rank, local_world_size):
         loss_valid = 0.0
         ix_bt = 0
         for inputs, target in loader_train:
-            inputs = inputs.to(local_rank) # cuda(non_blocking=True) # to(device)
-            target = target.to(local_rank) # cuda(non_blocking=True) # to(device)
+            inputs = inputs.to(local_rank)
+            target = target.to(local_rank)
             optimizer.zero_grad()
 
             output = model(inputs[:-1, :, :])
